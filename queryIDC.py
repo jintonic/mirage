@@ -1,228 +1,259 @@
-import os, json, warnings, idc_index
+import os, warnings, pydicom, webbrowser
 from textual import work, on
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, Label
 from textual.containers import Vertical, Horizontal
 from textual.binding import Binding
 
-# Ignore metadata warnings from the IDC/DuckDB backend
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# Setup local cache paths
-CACHE_DIR = os.path.expanduser("~/.cache/mirage")
-CACHE_PATH = os.path.join(CACHE_DIR, "idc.json")
-DOWNLOAD_DIR = os.path.join(CACHE_DIR, "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-class MIRAGEVimBrowser(App):
+class MIRAGEArchiveExplorer(App):
     """
-    MIRAGE IDC Browser
-    - Dictionary/Results on Left/Top.
-    - Values/Headers on Right/Bottom.
-    - 's': Toggle Multi-Sort (Slices then Size).
-    - 'Space': Toggle Filters (in Value mode) or Run Search (in Dict mode).
-    - 'Enter': Fetch Header to detail panel.
+    MIRAGE Local Archive Explorer
+    Top Row: 4 Panels (Collection -> Case -> Study -> Series)
+    Bottom Row: 1 Panel (Slice List <-> Header Table)
     """
-    
     CSS = """
     Screen { background: #002b36; color: #839496; }
-    #main_container { height: 1fr; }
-    
-    /* Layout Areas */
-    #left_area { height: 1fr; width: 1.5fr; }
-    #right_area { height: 1fr; width: 1fr; border-left: solid #586e75; display: none; }
-    #top_panel, #bottom_panel, #results_panel { 
-        height: 1fr; border: tall #268bd2; background: #073642; margin: 1; 
-    }
-    
-    #bottom_panel { border: tall #d33682; }
-    #results_panel { border: tall #859900; display: none; }
-    
-    .title-label { padding: 0 1; background: #268bd2; color: #eee8d5; text-style: bold; width: 100%; }
-    .filter-bar { padding: 0 1; background: #586e75; color: #eee8d5; min-height: 1; }
-    
-    DataTable { color: #839496; }
-    DataTable > .datatable--cursor { background: #073642; color: #268bd2; text-style: bold; }
+    #top_row { height: 40%; border-bottom: double #586e75; }
+    #bottom_row { height: 60%; }
+    .pane { height: 1fr; border-right: solid #586e75; width: 1fr; }
+    .title-label { background: #268bd2; color: #eee8d5; text-style: bold; padding: 0 1; width: 100%; }
+    DataTable { background: #073642; border: none; }
+    #header_table { display: none; }
     """
 
     BINDINGS = [
-        Binding("escape", "reset_view", "Back/Reset", show=True),
-        Binding("s", "toggle_sort", "Sort Toggle", show=True),
-        Binding("q", "quit", "Exit", show=True),
+        Binding("q", "quit", "Exit"),
+        Binding("space", "toggle_view", "Header/Slices"),
+        Binding("r", "rescan", "Rescan CWD"),
+        Binding("v", "open_viewer", "View in IDC"),
     ]
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Label(" [ ACTIVE FILTERS ]: None", id="filter_display", classes="filter-bar")
+        with Horizontal(id="top_row"):
+            with Vertical(classes="pane"):
+                yield Label(" COLLECTIONS ", classes="title-label")
+                yield DataTable(id="col_table")
+            with Vertical(classes="pane"):
+                yield Label(" CASES ", classes="title-label")
+                yield DataTable(id="case_table")
+            with Vertical(classes="pane"):
+                yield Label(" STUDIES ", classes="title-label")
+                yield DataTable(id="study_table")
+            with Vertical(classes="pane"):
+                yield Label(" SERIES ", classes="title-label")
+                yield DataTable(id="series_table")
         
-        with Horizontal(id="main_container"):
-            # LEFT SIDE: Search & Dictionary
-            with Vertical(id="left_area"):
-                yield Label(" [ METADATA DICTIONARY ]", id="dict_title", classes="title-label")
-                yield DataTable(id="top_panel")
-                # Removed 'display=False' argument here
-                yield Label(" [ SEARCH RESULTS ]", id="res_title", classes="title-label")
-                yield DataTable(id="results_panel")
-            
-            # RIGHT SIDE: Detail Explorer
-            with Vertical(id="right_area"):
-                yield Label(" [ EXPLORER ]", id="bottom_title", classes="title-label")
-                yield DataTable(id="bottom_panel")
-                
+        with Vertical(id="bottom_row"):
+            yield Label(" DATA EXPLORER ", id="bottom_title", classes="title-label")
+            yield DataTable(id="slice_table")
+            yield DataTable(id="header_table") # Now a DataTable
         yield Footer()
 
     def on_mount(self) -> None:
-        self.filters = {}
-        self.sort_state = 0 # 0:Orig, 1:Desc, 2:Asc
-        self.top_table = self.query_one("#top_panel", DataTable)
-        self.bottom_table = self.query_one("#bottom_panel", DataTable)
-        self.results_table = self.query_one("#results_panel", DataTable)
-        
-        for t in [self.top_table, self.bottom_table, self.results_table]:
+        self.tables = {
+            "col": self.query_one("#col_table", DataTable),
+            "case": self.query_one("#case_table", DataTable),
+            "study": self.query_one("#study_table", DataTable),
+            "series": self.query_one("#series_table", DataTable),
+            "slice": self.query_one("#slice_table", DataTable),
+            "header": self.query_one("#header_table", DataTable)
+        }
+        for t in self.tables.values():
             t.cursor_type = "row"
         
-        self.top_table.add_columns("Column", "Sample")
-        self.bottom_table.add_columns("Value", "Count")
+        # Init Columns
+        self.tables["col"].add_column("Collection")
+        self.tables["case"].add_column("Patient ID")
+        self.tables["study"].add_column("Study UID")
+        self.tables["series"].add_columns("Modality", "Description")
+        self.tables["slice"].add_columns("Slice #", "Filename")
+        self.tables["header"].add_columns("Tag (G,E)", "Name", "Value")
         
-        if os.path.exists(CACHE_PATH):
-            try:
-                with open(CACHE_PATH, "r") as f:
-                    data = json.load(f)
-                    for k, v in data.items(): 
-                        self.top_table.add_row(str(k), str(v))
-            except Exception:
-                pass
-        self.initialize_backend()
-        self.top_table.focus()
-
-    @work(exclusive=True, thread=True)
-    def initialize_backend(self):
-        self.client = idc_index.IDCClient()
-        self.call_from_thread(self.notify, "IDC Connected")
-
-    def action_reset_view(self):
-        self.query_one("#dict_title").display = True
-        self.top_table.display = True
-        self.query_one("#res_title").display = False
-        self.results_table.display = False
-        self.query_one("#right_area").display = False
-        self.top_table.focus()
-
-    def action_toggle_sort(self):
-        if not self.results_table.display or self.results_table.row_count == 0:
-            return
-
-        self.sort_state = (self.sort_state + 1) % 3
-        if self.sort_state == 0:
-            self.notify("Resetting to Original Order")
-            self.run_full_search()
-            return
-
-        is_rev = (self.sort_state == 1)
-        mode = "[DESC]" if is_rev else "[ASC]"
-        self.notify(f"Sorting: Slices + Size {mode}")
-
-        try:
-            rows = [self.results_table.get_row(rk) for rk in self.results_table.rows]
-            rows.sort(key=lambda r: (int(float(r[3] or 0)), float(r[4] or 0)), reverse=is_rev)
-            self.results_table.clear()
-            for r in rows: 
-                self.results_table.add_row(*r)
-        except Exception as e:
-            self.notify(f"Sort Error: {e}", severity="error")
-
-    @on(DataTable.RowSelected, "#top_panel")
-    def dive_into_values(self, event: DataTable.RowSelected):
-        self.current_col = event.data_table.get_row_at(event.cursor_row)[0]
-        self.query_one("#right_area").display = True
-        self.update_value_list(self.current_col)
-
-    @work(exclusive=True, thread=True)
-    def update_value_list(self, col):
-        res = self.client.sql_query(f'SELECT "{col}", COUNT(*) FROM index GROUP BY "{col}" ORDER BY 2 DESC LIMIT 100')
-        self.call_from_thread(self.refresh_bottom, res)
-
-    def refresh_bottom(self, df):
-        self.bottom_table.clear(columns=True)
-        self.bottom_table.add_columns("Value", "Count")
-        self.query_one("#bottom_title", Label).update(f" [ VALUES: {self.current_col} ] ")
-        for _, r in df.iterrows(): 
-            self.bottom_table.add_row(str(r[0]), str(r[1]))
-        self.bottom_table.focus()
-
-    def on_key(self, event):
-        if event.key == "space":
-            if self.focused == self.bottom_table:
-                val = self.bottom_table.get_row_at(self.bottom_table.cursor_row)[0]
-                if self.current_col not in self.filters: self.filters[self.current_col] = set()
-                if val in self.filters[self.current_col]:
-                    self.filters[self.current_col].remove(val)
-                    if not self.filters[self.current_col]: self.filters.pop(self.current_col)
-                else: self.filters[self.current_col].add(val)
-                self.update_filter_bar()
-            elif self.focused == self.top_table:
-                self.run_full_search()
-
-    def run_full_search(self):
-        clauses = [f'"{c}" IN ({", ".join([f"\'{v}\'" for v in vs])})' for c, vs in self.filters.items()]
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        query = f'SELECT PatientID, Modality, BodyPartExamined, instanceCount, ROUND(series_size_MB,2), SeriesInstanceUID FROM index {where} LIMIT 500'
-        self.execute_search(query)
-
-    @work(exclusive=True, thread=True)
-    def execute_search(self, query):
-        df = self.client.sql_query(query)
-        self.call_from_thread(self.show_results, df)
-
-    def show_results(self, df):
-        self.query_one("#dict_title").display = False
-        self.top_table.display = False
-        self.query_one("#res_title").display = True
-        self.results_table.display = True
-        self.query_one("#right_area").display = False
-        
-        self.results_table.clear(columns=True)
-        self.results_table.add_columns("PatientID", "Modality", "BodyPart", "Slices", "Size(MB)", "UID")
-        for _, row in df.iterrows(): 
-            self.results_table.add_row(*[str(v) for v in row])
-        self.results_table.focus()
-
-    @on(DataTable.RowSelected, "#results_panel")
-    def handle_header_request(self, event: DataTable.RowSelected):
-        uid = event.data_table.get_row_at(event.cursor_row)[5]
-        self.fetch_header_data(uid)
+        self.action_rescan()
 
     @work(thread=True)
-    def fetch_header_data(self, uid):
-        try:
-            self.call_from_thread(self.notify, f"Fetching Header: {uid[:8]}...")
-            query = f"SELECT * FROM index WHERE SeriesInstanceUID='{uid}' LIMIT 1"
-            df = self.client.sql_query(query)
-            if not df.empty:
-                items = [(str(c), str(df.iloc[0][c])) for c in df.columns if str(df.iloc[0][c]).strip().lower() != "none"]
-                self.call_from_thread(self.display_header_in_panel, items)
-            else:
-                self.call_from_thread(self.notify, "No metadata found", severity="warning")
-        except Exception as e:
-            self.call_from_thread(self.notify, f"Error: {e}", severity="error")
+    def action_rescan(self):
+        archive_map = {}
+        cwd = os.getcwd()
+        for root, _, files in os.walk(cwd):
+            dcm_files = [f for f in sorted(files) if f.endswith(".dcm")]
+            if dcm_files:
+                rel_path = os.path.relpath(root, cwd)
+                parts = rel_path.split(os.sep)
+                if len(parts) >= 3:
+                    coll_case, study_uid, series_uid = parts[-3], parts[-2], parts[-1]
+                    coll = coll_case.rsplit('-', 1)[0] if '-' in coll_case else "Local"
+                    case = coll_case.rsplit('-', 1)[1] if '-' in coll_case else coll_case
+                    s_map = archive_map.setdefault(coll, {}).setdefault(case, {}).setdefault(study_uid, {})
+                    s_map[series_uid] = [os.path.join(root, f) for f in dcm_files]
+        self.archive_map = archive_map
+        self.call_from_thread(self.auto_initialize_ui)
 
-    def display_header_in_panel(self, items):
-        self.query_one("#right_area").display = True
-        self.bottom_table.clear(columns=True)
-        self.bottom_table.add_columns("DICOM Tag", "Value")
-        self.query_one("#bottom_title", Label).update(" [ DICOM HEADER EXPLORER ] ")
-        for tag, val in items: 
-            self.bottom_table.add_row(tag, val)
-        self.bottom_table.focus()
-        self.notify("Header Loaded")
+    def auto_initialize_ui(self):
+        """Populates all tables and drills down to the first series automatically."""
+        self.populate_collections()
+        
+        # 1. Select first Collection
+        if self.tables["col"].row_count > 0:
+            # Get the first key from the rows dictionary (ordered in newer Python)
+            first_key = list(self.tables["col"].rows.keys())[0]
+            self.tables["col"].move_cursor(row=0)
+            self.manual_select_coll(first_key.value)
+            
+        # 2. Select first Case
+        if self.tables["case"].row_count > 0:
+            first_key = list(self.tables["case"].rows.keys())[0]
+            self.tables["case"].move_cursor(row=0)
+            self.manual_select_case(first_key.value)
+            
+        # 3. Select first Study
+        if self.tables["study"].row_count > 0:
+            first_key = list(self.tables["study"].rows.keys())[0]
+            self.tables["study"].move_cursor(row=0)
+            self.manual_select_study(first_key.value)
+            
+        # 4. Select first Series
+        if self.tables["series"].row_count > 0:
+            first_key = list(self.tables["series"].rows.keys())[0]
+            self.tables["series"].move_cursor(row=0)
+            self.manual_select_series(first_key.value)
 
-    def on_resize(self, event):
-        container = self.query_one("#main_container")
-        container.styles.layout = "horizontal" if event.size.width > 120 else "vertical"
+        self.tables["col"].focus()
 
-    def update_filter_bar(self):
-        msg = " AND ".join([f"{k} IN {tuple(v) if len(v)>1 else '('+repr(list(v)[0])+')'}" for k, v in self.filters.items()]) or "None"
-        self.query_one("#filter_display", Label).update(f" [ ACTIVE FILTERS ]: {msg}")
+    # --- Manual Selection Helpers ---
+    # These allow the UI to populate without a physical 'Enter' key press
+    
+    def manual_select_coll(self, coll_id):
+        self.tables["case"].clear()
+        for case in sorted(self.archive_map[coll_id].keys()):
+            self.tables["case"].add_row(case, key=f"{coll_id}|{case}")
+
+    def manual_select_case(self, key_str):
+        coll, case = key_str.split('|')
+        self.tables["study"].clear()
+        for study in sorted(self.archive_map[coll][case].keys()):
+            self.tables["study"].add_row(f"{study[:8]}...{study[-8:]}", key=f"{coll}|{case}|{study}")
+
+    def manual_select_study(self, key_str):
+        coll, case, study = key_str.split('|')
+        self.tables["series"].clear()
+        for sid, paths in self.archive_map[coll][case][study].items():
+            ds = pydicom.dcmread(paths[0], stop_before_pixels=True)
+            self.tables["series"].add_row(
+                getattr(ds, "Modality", "??"), 
+                getattr(ds, "SeriesDescription", "None")[:15], 
+                key=f"{coll}|{case}|{study}|{sid}"
+            )
+
+    def manual_select_series(self, key_str):
+        coll, case, study, sid = key_str.split('|')
+        paths = self.archive_map[coll][case][study][sid]
+        self.tables["slice"].clear()
+        for i, p in enumerate(paths):
+            self.tables["slice"].add_row(str(i+1), os.path.basename(p), key=p)
+
+    def populate_collections(self):
+        self.tables["col"].clear()
+        for c in sorted(self.archive_map.keys()): self.tables["col"].add_row(c, key=c)
+        self.tables["col"].focus()
+
+    @on(DataTable.RowSelected, "#col_table")
+    def select_coll(self, event):
+        coll = event.row_key.value
+        self.tables["case"].clear()
+        for case in sorted(self.archive_map[coll].keys()):
+            self.tables["case"].add_row(case, key=f"{coll}|{case}")
+        self.tables["case"].focus()
+
+    @on(DataTable.RowSelected, "#case_table")
+    def select_case(self, event):
+        coll, case = event.row_key.value.split('|')
+        self.tables["study"].clear()
+        for study in sorted(self.archive_map[coll][case].keys()):
+            self.tables["study"].add_row(f"{study[:8]}...{study[-8:]}", key=f"{coll}|{case}|{study}")
+        self.tables["study"].focus()
+
+    @on(DataTable.RowSelected, "#study_table")
+    def select_study(self, event):
+        coll, case, study_folder = event.row_key.value.split('|')
+        series_map = self.archive_map[coll][case][study_folder]
+        self.tables["series"].clear()
+        
+        for sid_folder, paths in series_map.items():
+            # We skip the pydicom.dcmread here for speed!
+            # Just show the folder name or a placeholder
+            self.tables["series"].add_row(
+                "??", # Modality will be filled when selected
+                sid_folder[:20], 
+                key=f"{coll}|{case}|{study_folder}|{sid_folder}"
+            )
+        self.tables["series"].focus()
+
+    @on(DataTable.RowSelected, "#series_table")
+    def select_series(self, event):
+        coll, case, study, sid = event.row_key.value.split('|')
+        paths = self.archive_map[coll][case][study][sid]
+        self.tables["slice"].clear()
+        for i, p in enumerate(paths):
+            self.tables["slice"].add_row(str(i+1), os.path.basename(p), key=p)
+        self.tables["slice"].focus()
+
+    def action_toggle_view(self):
+        h_table = self.tables["header"]
+        s_table = self.tables["slice"]
+        title = self.query_one("#bottom_title", Label)
+        
+        if h_table.display:
+            h_table.display = False
+            s_table.display = True
+            title.update(" [ SLICE LIST ] ")
+            s_table.focus()
+        else:
+            if s_table.row_count > 0:
+                # Proper coordinate-to-key mapping for newer Textual
+                row_key, _ = s_table.coordinate_to_cell_key(s_table.cursor_coordinate)
+                path = row_key.value
+                self.populate_header_table(path)
+                h_table.display = True
+                s_table.display = False
+                title.update(f" [ HEADER: {os.path.basename(path)} ] ")
+                h_table.focus()
+
+    def populate_header_table(self, path):
+        ds = pydicom.dcmread(path, stop_before_pixels=True)
+        self.tables["header"].clear()
+        for el in ds:
+            if el.tag.group < 0x7FE0:
+                tag_hex = f"({el.tag.group:04X},{el.tag.element:04X})"
+                self.tables["header"].add_row(tag_hex, el.name, str(el.value))
+
+    def action_open_viewer(self):
+        """Extracts UIDs from the exact DICOM file highlighted in the slice list."""
+        if self.tables["slice"].row_count > 0:
+            # Get the path of the specific slice highlighted in the bottom table
+            row_key, _ = self.tables["slice"].coordinate_to_cell_key(
+                self.tables["slice"].cursor_coordinate
+            )
+            file_path = row_key.value
+            
+            # Read the file to get the absolute ground truth
+            ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+            
+            # Get the UIDs from the official DICOM tags
+            study_uid = str(ds.StudyInstanceUID)
+            series_uid = str(ds.SeriesInstanceUID)
+            
+            url = (
+                f"https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?"
+                f"StudyInstanceUIDs={study_uid}&"
+                f"SeriesInstanceUIDs={series_uid}"
+            )
+            
+            self.notify(f"Launching IDC Viewer for Slice: {os.path.basename(file_path)}")
+            webbrowser.open(url)
 
 if __name__ == "__main__":
-    MIRAGEVimBrowser().run()
+    MIRAGEArchiveExplorer().run()
